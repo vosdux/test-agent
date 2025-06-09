@@ -1,0 +1,35 @@
+{
+  "name": "test-gen",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "bin": {
+    "test-gen": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@babel/parser": "^7.27.5",
+    "@babel/traverse": "^7.27.4",
+    "@langchain/community": "^0.3.45",
+    "@langchain/core": "^0.3.57",
+    "@types/commander": "^2.12.0",
+    "commander": "^12.1.0",
+    "dotenv": "^16.5.0",
+    "gigachat": "^0.0.14",
+    "hnswlib-node": "^3.0.0",
+    "langchain": "^0.3.27",
+    "langchain-gigachat": "^0.0.13"
+  },
+  "devDependencies": {
+    "@types/babel__parser": "^7.0.0",
+    "@types/babel__traverse": "^7.20.7",
+    "@types/node": "^22.15.30",
+    "typescript": "^5.8.3"
+  }
+}
