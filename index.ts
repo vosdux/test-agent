@@ -5,6 +5,8 @@ import traverse from "@babel/traverse";
 import { GigaChat } from "langchain-gigachat";
 import { Agent } from "https";
 import dotenv from "dotenv";
+import { HumanMessage, SystemMessage } from "@langchain/core/messages";
+import { getAnalysisPrompt, implementationPromptText, getMswPromptText, mswSystemPromptText, reviewPromptText, systemPromptText } from "./prompts";
 
 dotenv.config();
 
@@ -17,7 +19,6 @@ type DependencyGraph = Record<
 >;
 
 type TestGenerationOptions = {
-  exampleTestPath?: string;
   testUtilsPaths?: string[];
   referenceTestsPaths?: string[];
   outputPath?: string;
@@ -26,7 +27,6 @@ type TestGenerationOptions = {
 type TestGenerationContext = {
   entryCode: string;
   dependenciesCode: string[];
-  testFramework: string;
   entryPath: string;
   testUtils?: string[];
   referenceTests?: string[];
@@ -53,7 +53,7 @@ export class AstTestGenerator {
 
     this.llm = new GigaChat({
       credentials: process.env.GIGA_API_KEY,
-      model: "GigaChat-2",
+      model: "GigaChat-2-Max",
       temperature: 0.2,
       topP: 0.8,
       httpsAgent: new Agent({ rejectUnauthorized: false }),
@@ -73,10 +73,11 @@ export class AstTestGenerator {
   ): Promise<string> {
     const absolutePath = path.resolve(entryPath);
     const context = await this.buildTestContext(absolutePath, options);
-    const testCode = await this.generateTestCode(context);
+    const cleanedCode = await this.generateTestCode(context);
+
     const testFilePath = this.getTestFilePath(absolutePath, options);
     this.ensureDirectoryExists(testFilePath);
-    fs.writeFileSync(testFilePath, testCode);
+    fs.writeFileSync(testFilePath, cleanedCode);
 
     return testFilePath;
   }
@@ -124,7 +125,6 @@ export class AstTestGenerator {
     return {
       entryCode,
       dependenciesCode: this.getDependenciesCode(graph, entryPath),
-      testFramework: this.detectTestFramework(entryPath),
       entryPath,
       testUtils,
       referenceTests,
@@ -308,6 +308,7 @@ export class AstTestGenerator {
     entryPath: string
   ): string[] {
     const processed = new Set<string>();
+    const absoluteEntryPath = path.resolve(entryPath);
 
     const collectDependencies = (currentPath: string): string[] => {
       if (processed.has(currentPath)) {
@@ -317,17 +318,16 @@ export class AstTestGenerator {
       processed.add(currentPath);
       const dependencies = graph[currentPath]?.dependencies || [];
 
-      const currentCode = `// ${currentPath}\n${graph[currentPath]?.code || ""
-        }`;
+      const currentCode = `// ${currentPath}\n${graph[currentPath]?.code || ""}`;
       const nestedDependencies = dependencies
-        .filter((dep) => dep !== entryPath)
         .flatMap((dep) => collectDependencies(dep));
 
       return [currentCode, ...nestedDependencies];
     };
 
-    const absolutePath = path.resolve(entryPath);
-    const allDependencies = collectDependencies(absolutePath);
+    // Начинаем с зависимостей entry файла
+    const entryDependencies = graph[absoluteEntryPath]?.dependencies || [];
+    const allDependencies = entryDependencies.flatMap(dep => collectDependencies(dep));
 
     return allDependencies.filter((code) => code.length > 0);
   }
@@ -335,7 +335,7 @@ export class AstTestGenerator {
   /**
    * Генерирует тестовый код с использованием модели GigaChat.
    * @param context - Контекст генерации тестов
-   * @returns Promise<string> - Сгенерированный тестовый код
+   * @returns Promise<string> - Сгенерированный тестовый код и ответы от модели
    */
   private async generateTestCode(
     context: TestGenerationContext
@@ -343,7 +343,6 @@ export class AstTestGenerator {
     const {
       entryCode,
       dependenciesCode,
-      testFramework,
       entryPath,
       testUtils,
       referenceTests,
@@ -366,213 +365,104 @@ export class AstTestGenerator {
       console.log("\nℹ️ No dependencies found");
     }
 
-    console.log(
-      "\n🔍 Total context size:",
-      entryCode.length +
-      dependenciesCode.reduce((sum, code) => sum + code.length, 0),
-      "characters"
+    const systemPrompt = new SystemMessage(systemPromptText);
+
+    // Step 1: Analyze component and generate test structure
+    const analysisPrompt = new HumanMessage(
+      getAnalysisPrompt(fileName, entryCode, dependenciesCode, testUtils, referenceTests)
     );
-    console.log("------------------------\n");
 
-    const prompt = `
-You are a senior QA engineer. Generate comprehensive integration tests for the ${testFramework} component.
+    const chain = [systemPrompt, analysisPrompt];
 
-File: ${fileName}
-Test framework: Vitest + React Testing Library + MSW
+    console.log("🤖 Step 1: Analyzing component...");
 
-Main component code:
-\`\`\`typescript
-${entryCode}
-\`\`\`
+    const analysisResponse = await this.llm.invoke(chain);
 
-Dependencies:
-\`\`\`typescript
-${dependenciesCode.join("\n\n")}
-\`\`\`
+    // Step 2: Generate test implementation
+    const implementationPrompt = new HumanMessage(
+      implementationPromptText
+    );
 
-${testUtils
-        ? `Test utilities:
-\`\`\`typescript
-${testUtils.join("\n\n")}
-\`\`\`
-`
-        : ""
-      }
+    chain.push(analysisResponse, implementationPrompt)
 
-${referenceTests
-        ? `Reference tests:
-\`\`\`typescript
-${referenceTests.join("\n\n")}
-\`\`\`
-`
-        : ""
-      }
+    console.log("🤖 Step 2: Generating test implementation...");
+    const implementationResponse = await this.llm.invoke(chain);
 
-Requirements:
-1. User Scenarios Coverage:
-   - CRUD operations (Create, Read, Update, Delete)
-   - Form submissions and validations
-   - Data filtering and sorting
-   - Pagination and infinite scroll
-   - Search functionality
-   - File uploads/downloads if present
+    // Step 3: Review and improvements
+    const reviewPrompt = new HumanMessage(reviewPromptText)
 
-2. UI Interactions:
-   - All clickable elements (buttons, links, checkboxes)
-   - Form inputs (text fields, selects, radio buttons)
-   - Modal dialogs and popups
-   - Dropdown menus and tooltips
-   - Drag and drop if applicable
-   - Keyboard navigation
+    chain.push(implementationResponse, reviewPrompt);
 
-3. Data Flow:
-   - API calls and responses
-   - Loading states
-   - Error handling
-   - Success messages
-   - Data persistence
-   - Cache management
+    console.log("🤖 Step 3 Review and improvements...");
+    const reviewResponse = await this.llm.invoke(chain);
 
-4. Edge Cases:
-   - Empty states
-   - Error states
-   - Network failures
-   - Invalid inputs
-   - Concurrent operations
-   - Session timeouts
+    // Step 4: Improve MSW mocks
+    const mswSystemPrompt = new SystemMessage(mswSystemPromptText)
+    const mswPrompt = new HumanMessage(getMswPromptText(reviewResponse.content as string));
 
-5. Testing Best Practices:
-   - Use MSW version 2 for API mocking
-   - Follow the same style as example test
-   - Use data-testid attributes
-   - Test accessibility
-   - Verify component state changes
-   - Check side effects
+    console.log("🤖 Step 4: Improving MSW mocks...");
+    const mswResponse = await this.llm.invoke([mswSystemPrompt, mswPrompt]);
 
-6. dont test aria-attributes
+    // Save all responses to a file
+    const responses = {
+      analysis: {
+        prompt: `${systemPrompt.content} ${analysisPrompt.content}`,
+        response: analysisResponse.content,
+      },
+      implementation: {
+        prompt: implementationPrompt.content,
+        response: implementationResponse.content,
+      },
+      review: {
+        prompt: reviewPrompt.content,
+        response: reviewResponse.content,
+      },
+      msw: {
+        prompt: `${mswSystemPrompt.content} ${mswPrompt.content}`,
+        response: mswResponse.content,
+      },
+    };
 
-
-Generate a complete test file that covers all these aspects. Focus on real user interactions and business logic.
-Output ONLY the test code without explanations.
-`;
-
-    console.log("🤖 Sending prompt to GigaChat...");
-    const response = await this.llm.invoke(prompt);
-
-    const improvePrompt = `
-      You are a senior QA engineer. Improve the existing test.
-
-      Current test:
-      \`\`\`typescript
-      ${response.content}
-      \`\`\`
-
-      Requirements:
-      Check server mock with msw. dont user rest and ctx function.
-      It is old version of msw. Use http and HttpResponse from msw.
-
-      Bad mocking example:
-      \`\`\`typescript
-      const server = setupServer(
-        rest.get('https://jsonplaceholder.typicode.com/todos?_limit=10', (req, res, ctx) => {
-          return res(ctx.json([{ id: 1, title: 'Task 1', completed: false }, { id: 2, title: 'Task 2', completed: true }, { id: 3, title: 'Task 3', completed: false }]))
-        }),
-      )
-
-      // bad use request to get data example
-      http.post('https://jsonplaceholder.typicode.com/todos', (request) => {
-        const body = JSON.parse(request.body);
-        return HttpResponse.json({ id: 4, text: body.title, completed: false });
-      }),
-
-      // bad get params example
-      http.put('https://jsonplaceholder.typicode.com/todos/:id', (request) => {
-        const params = request.params;
-        const body = JSON.parse(request.body);
-        return HttpResponse.json({
-          id: parseInt(params.id),
-          text: body.title,
-          completed: body.completed,
-        });
-      }),
-
-      // bad get empty data example
-      http.delete('https://jsonplaceholder.typicode.com/todos/:id', () => {
-        return HttpResponse.empty();
-      }),
-      \`\`\`
-
-      Good mocking example:
-      \`\`\`typescript
-        import { http, HttpResponse } from 'msw'
-        import { setupServer } from 'msw/node'
-
-        const handlers = [
-          // success response
-          http.get('https://jsonplaceholder.typicode.com/todos?_limit=10', () =>
-            HttpResponse.json([
-              { id: 1, title: 'Task 1', completed: false },
-              { id: 2, title: 'Task 2', completed: true },
-              { id: 3, title: 'Task 3', completed: false },
-            ]),
-          ),
-
-          // error response with status 401
-          http.get('https://jsonplaceholder.typicode.com/todos?_limit=10', () =>
-            HttpResponse.json(
-              { error: 'Unauthorized' },
-              { status: 401 },
-            ),
-          ),
-
-          // network error
-          http.get('https://jsonplaceholder.typicode.com/todos?_limit=10', () =>
-            HttpResponse.error(),
-          ),
-
-          // use request to get data
-          http.get('https://jsonplaceholder.typicode.com/todos?_limit=10', async ({ request }) => {
-            const data = await request.clone().json();
-
-            if (data?.id === 'abc-123') {
-              return HttpResponse.json({ id: 'abc-123' })
-            }
-
-            return HttpResponse.json({ id: 'not-found' })
-            }
-          ),
-
-          // good get params example
-          http.put('https://jsonplaceholder.typicode.com/todos/:id', async ({ request, params }) => {
-            const { id } = params;
-            const body = await request.clone().json();
-            return HttpResponse.json({
-              id,
-              text: body.title,
-              completed: body.completed,
-            });
-          }),
-
-          // good get empty data example
-          http.delete('https://jsonplaceholder.typicode.com/todos/:id', () => {
-            return HttpResponse.json();
-          }),
-        ]
-
-        setupServer(...handlers)
-      \`\`\`
-
-      Improve the test by using good mocking example.
-      
-      Output ONLY the improved test code without explanations.
+    // Generate HTML content
+    const htmlContent = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>Test Generation Responses</title>
+          <style>
+            body { font-family: monospace; padding: 20px; }
+            .section { margin-bottom: 30px; }
+            .prompt { background: #f5f5f5; padding: 10px; margin: 10px 0; }
+            .response { background: #e8f4f8; padding: 10px; margin: 10px 0; }
+            pre { white-space: pre-wrap; word-wrap: break-word; }
+          </style>
+        </head>
+        <body>
+          <h1>Test Generation Responses</h1>
+          ${Object.entries(responses).map(([key, data]) => `
+            <div class="section">
+              <h2>${key.charAt(0).toUpperCase() + key.slice(1)}</h2>
+              <div class="prompt">
+                <h3>Prompt:</h3>
+                <pre>${this.escapeHtml(typeof data.prompt === 'string' ? data.prompt : JSON.stringify(data.prompt))}</pre>
+              </div>
+              <div class="response">
+                <h3>Response:</h3>
+                <pre>${this.escapeHtml(typeof data.response === 'string' ? data.response : JSON.stringify(data.response))}</pre>
+              </div>
+            </div>
+          `).join('')}
+        </body>
+      </html>
     `;
 
-    console.log("🤖 Sending improve prompt to GigaChat...");
-    const improveResponse = await this.llm.invoke(improvePrompt);
+    // Save responses to an HTML file in the library directory
+    const responsesPath = path.join(__dirname, 'responses.html');
+    fs.writeFileSync(responsesPath, htmlContent);
 
-    if (typeof improveResponse.content === "string") {
+    if (typeof mswResponse.content === "string") {
       const cleanedCode = this.cleanGeneratedCode(
-        improveResponse.content || "error"
+        mswResponse.content || "error"
       );
       console.log("✅ Test code generated successfully");
       return cleanedCode;
@@ -580,6 +470,20 @@ Output ONLY the test code without explanations.
 
     console.error("❌ Failed to generate test code");
     return "error";
+  }
+
+  /**
+   * Экранирует HTML-теги в тексте для безопасного отображения в HTML.
+   * @param text - Текст для экранирования
+   * @returns string - Экранированный текст
+   */
+  private escapeHtml(text: string): string {
+    return text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
   }
 
   /**
@@ -602,15 +506,15 @@ Output ONLY the test code without explanations.
     return code.replace(/```[^\n]*/g, "").trim();
   }
 
-  /**
-   * Определяет тестовый фреймворк на основе расширения файла.
-   * @param filePath - Путь к файлу
-   * @returns string - Определенный фреймворк ('Vue', 'Svelte' или 'React')
-   */
-  private detectTestFramework(filePath: string): string {
-    const ext = path.extname(filePath).toLowerCase();
-    return ext === ".vue" ? "Vue" : ext === ".svelte" ? "Svelte" : "React";
-  }
+  // /**
+  //  * Определяет тестовый фреймворк на основе расширения файла.
+  //  * @param filePath - Путь к файлу
+  //  * @returns string - Определенный фреймворк ('Vue', 'Svelte' или 'React')
+  //  */
+  // private detectTestFramework(filePath: string): string {
+  //   const ext = path.extname(filePath).toLowerCase();
+  //   return ext === ".vue" ? "Vue" : ext === ".svelte" ? "Svelte" : "React";
+  // }
 
   /**
    * Определяет путь для выходного тестового файла.
@@ -627,11 +531,11 @@ Output ONLY the test code without explanations.
     }
 
     const parsed = path.parse(originalPath);
-    return path.join(
+    return path.join(path.join(
       parsed.dir,
       "__tests__",
       `${parsed.name}.test${parsed.ext}`
-    );
+    ))
   }
 
   /**

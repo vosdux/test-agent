@@ -47,7 +47,6 @@ program
   .command('generate')
   .description('Generate integration tests for a component')
   .argument('<componentPath>', 'Path to the component file')
-  .option('-e, --example <path>', 'Path to example test file')
   .option('-u, --utils <paths...>', 'Paths to test utility files')
   .option('-t, --tests <paths...>', 'Paths to existing test files for reference')
   .option('-i, --interactive', 'Enable interactive mode for test improvements')
@@ -64,7 +63,6 @@ program
       const result = await generator.generateTests(
         path.resolve(componentPath),
         {
-          exampleTestPath: options.example ? path.resolve(options.example) : undefined,
           testUtilsPaths: options.utils?.map(p => path.resolve(p)),
           referenceTestsPaths: options.tests?.map(p => path.resolve(p)),
           outputPath: options.output ? path.resolve(options.output) : undefined
